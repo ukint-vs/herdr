@@ -42,6 +42,8 @@ Detected but less thoroughly tested: Gemini CLI and Cline. Unsupported agents st
 
 Herdr first detects the foreground process in each pane. After that, each pane has one status authority.
 
+For a direct Node or Bun script launch, Herdr can also recognize a locally forked Pi or OMP checkout when its nearest `package.json` declares that exact script as `bin.pi` or `bin.omp`. String-form `bin` works when the package name implies `pi` or `omp`. The checkout name does not matter. Relative script arguments use the process working directory; if it is unavailable, use an absolute script path. Identity detection alone does not install lifecycle hooks.
+
 For agents with complete lifecycle hooks, the integration is authoritative when it is installed and actively reporting for the running pane. Herdr uses those hook reports for `idle`, `working`, `blocked`, and session identity. It does not also run screen manifest fallback for that same lifecycle authority. This avoids two competing sources of truth.
 
 For agents without complete lifecycle hooks, Herdr identifies the foreground process and reads the live bottom-buffer screen snapshot. It evaluates TOML manifests against that snapshot to classify `idle`, `working`, and `blocked`. For agents that emit them, manifests can also match terminal title and progress (OSC) sequences as detection evidence; when that evidence is absent, screen rules carry detection on their own.

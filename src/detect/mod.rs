@@ -404,7 +404,140 @@ fn normalized_process_name(process: &crate::platform::ForegroundProcess) -> Stri
         return wrapped_agent;
     }
 
-    effective.to_string()
+    declared_agent_from_process(process)
+        .map(|agent| agent_label(agent).to_string())
+        .unwrap_or_else(|| effective.to_string())
+}
+
+fn declared_agent_from_process(process: &crate::platform::ForegroundProcess) -> Option<Agent> {
+    let argv = process.argv.as_deref()?;
+    let runtime = normalized_agent_lookup_name(path_basename(argv.first()?));
+    if !matches!(runtime.as_str(), "node" | "bun") {
+        return None;
+    }
+    let token = script_arg_token(argv, &["-e", "--eval", "-p", "--print"], &[], true)?;
+    if token.is_empty() || token == "-" {
+        return None;
+    }
+    let script = std::path::Path::new(token);
+    if script.is_absolute() {
+        package_entrypoint_agent_at(script, std::time::Instant::now())
+    } else {
+        let cwd = crate::platform::process_cwd(process.pid)?;
+        cwd.is_absolute()
+            .then(|| cwd.join(script))
+            .and_then(|script| package_entrypoint_agent_at(&script, std::time::Instant::now()))
+    }
+}
+
+const PACKAGE_MANIFEST_MAX_ANCESTORS: usize = 8;
+const PACKAGE_MANIFEST_MAX_BYTES: u64 = 256 * 1024;
+const PACKAGE_ENTRYPOINT_CACHE_CAPACITY: usize = 64;
+const PACKAGE_ENTRYPOINT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+struct PackageEntrypointCacheEntry {
+    script: std::path::PathBuf,
+    checked_at: std::time::Instant,
+    agent: Option<Agent>,
+}
+
+thread_local! {
+    static PACKAGE_ENTRYPOINT_CACHE: std::cell::RefCell<std::collections::VecDeque<PackageEntrypointCacheEntry>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+}
+
+fn package_entrypoint_agent_at(script: &std::path::Path, now: std::time::Instant) -> Option<Agent> {
+    // ponytail: per-thread 5-second FIFO (64 paths), 8 parents; widen only if real probes outgrow it.
+    if let Some(agent) = PACKAGE_ENTRYPOINT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.retain(|entry| {
+            now.saturating_duration_since(entry.checked_at) < PACKAGE_ENTRYPOINT_CACHE_TTL
+        });
+        cache
+            .iter()
+            .find(|entry| entry.script == script)
+            .map(|entry| entry.agent)
+    }) {
+        return agent;
+    }
+    let agent = read_package_entrypoint_agent(script);
+    PACKAGE_ENTRYPOINT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.len() == PACKAGE_ENTRYPOINT_CACHE_CAPACITY {
+            cache.pop_front();
+        }
+        cache.push_back(PackageEntrypointCacheEntry {
+            script: script.to_path_buf(),
+            checked_at: now,
+            agent,
+        });
+    });
+    agent
+}
+
+fn read_package_entrypoint_agent(script: &std::path::Path) -> Option<Agent> {
+    use std::io::Read;
+
+    let script = std::fs::canonicalize(script).ok()?;
+    if !script.is_file() {
+        return None;
+    }
+    for dir in script
+        .parent()?
+        .ancestors()
+        .take(PACKAGE_MANIFEST_MAX_ANCESTORS)
+    {
+        let manifest = match std::fs::File::open(dir.join("package.json")) {
+            Ok(manifest) => manifest,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        let metadata = manifest.metadata().ok()?;
+        if !metadata.is_file() || metadata.len() > PACKAGE_MANIFEST_MAX_BYTES {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        manifest
+            .take(PACKAGE_MANIFEST_MAX_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.len() as u64 > PACKAGE_MANIFEST_MAX_BYTES {
+            return None;
+        }
+        let package: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let bin = package.as_object()?.get("bin")?;
+        let declared = |value: &serde_json::Value| {
+            let target = std::path::Path::new(value.as_str()?);
+            if target.as_os_str().is_empty() || target.is_absolute() {
+                return None;
+            }
+            std::fs::canonicalize(dir.join(target))
+                .ok()
+                .filter(|target| *target == script)
+        };
+        return match bin {
+            serde_json::Value::Object(entries) => {
+                let pi = entries.get("pi").and_then(&declared).is_some();
+                let omp = entries.get("omp").and_then(&declared).is_some();
+                match (pi, omp) {
+                    (true, false) => Some(Agent::Pi),
+                    (false, true) => Some(Agent::Omp),
+                    _ => None,
+                }
+            }
+            serde_json::Value::String(_) => {
+                let name = package.get("name")?.as_str()?.rsplit('/').next()?;
+                let agent = match name {
+                    "pi" => Agent::Pi,
+                    "omp" => Agent::Omp,
+                    _ => return None,
+                };
+                declared(bin).map(|_| agent)
+            }
+            _ => None,
+        };
+    }
+    None
 }
 
 fn wrapped_agent_name_from_runtime_argv(runtime: &str, argv: Option<&[String]>) -> Option<String> {
@@ -536,28 +669,46 @@ fn script_arg_agent_name(
     eval_flags: &[&str],
     module_flags: &[&str],
 ) -> Option<String> {
+    script_arg_token(argv, eval_flags, module_flags, false).and_then(agent_name_from_path_token)
+}
+
+fn script_arg_token<'a>(
+    argv: &'a [String],
+    eval_flags: &[&str],
+    module_flags: &[&str],
+    strict_options: bool,
+) -> Option<&'a str> {
     let mut args = argv.iter().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--" {
-            return args
-                .next()
-                .and_then(|token| agent_name_from_path_token(token));
+            return args.next().map(String::as_str);
         }
-
         if flag_matches(arg, eval_flags) || flag_matches(arg, module_flags) {
             return None;
         }
-
         if arg.starts_with('-') {
             if option_takes_value(arg) {
-                let _ = args.next();
+                let value = args.next();
+                if strict_options && value.is_none_or(|value| value.starts_with('-')) {
+                    return None;
+                }
+            } else if strict_options
+                && !matches!(
+                    arg.as_str(),
+                    "--no-warnings"
+                        | "--enable-source-maps"
+                        | "--expose-gc"
+                        | "--watch"
+                        | "--hot"
+                        | "--smol"
+                )
+            {
+                return None;
             }
             continue;
         }
-
-        return agent_name_from_path_token(arg);
+        return Some(arg);
     }
-
     None
 }
 
@@ -884,7 +1035,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn temp_detection_path(name: &str) -> std::path::PathBuf {
         let unique = format!(
             "herdr-detect-tests-{}-{}-{}",
@@ -1469,7 +1619,319 @@ mod tests {
         };
         assert_eq!(identify_agent_in_job(&other_script), None);
     }
+    #[test]
+    fn identify_agent_in_job_detects_declared_pi_family_entrypoints() {
+        for (runtime, command, agent) in [
+            ("/opt/bun/bin/bun", "omp", Agent::Omp),
+            ("/opt/node/bin/node", "pi", Agent::Pi),
+        ] {
+            let root = temp_detection_path("renamed checkout with spaces");
+            let package = root.join("arbitrary package");
+            let script = package.join("src/cli.ts");
+            std::fs::create_dir_all(script.parent().expect("script parent")).expect("create dirs");
+            std::fs::write(&script, "// fixture").expect("create script");
+            std::fs::write(
+                package.join("package.json"),
+                format!(r#"{{"name":"@example/renamed","bin":{{"{command}":"src/cli.ts"}}}}"#),
+            )
+            .expect("create manifest");
+            let script = script.to_str().expect("utf8 temporary path");
+            let job = crate::platform::ForegroundJob {
+                process_group_id: 123,
+                processes: vec![foreground_process(123, "runtime", &[runtime, script])],
+            };
+            assert_eq!(
+                identify_agent_in_job(&job),
+                Some((agent, command.to_string())),
+                "runtime: {runtime}"
+            );
+            std::fs::remove_dir_all(root).expect("remove fixture");
+        }
+    }
 
+    #[test]
+    fn script_arg_token_preserves_runtime_operand_boundaries() {
+        let flags = &["-e", "--eval", "-p", "--print"];
+        for (args, expected) in [
+            (
+                vec!["node", "--", "/tmp/checkout with spaces/src/cli.ts"],
+                Some("/tmp/checkout with spaces/src/cli.ts"),
+            ),
+            (
+                vec!["node", "--require", "loader", "--watch", "/tmp/cli.ts"],
+                Some("/tmp/cli.ts"),
+            ),
+            (
+                vec![
+                    "bun",
+                    "--hot",
+                    "--smol",
+                    "--enable-source-maps",
+                    "/tmp/cli.ts",
+                ],
+                Some("/tmp/cli.ts"),
+            ),
+            (vec!["node", "--unknown", "/tmp/cli.ts"], None),
+            (vec!["node", "--require"], None),
+            (vec!["node", "--require", "--eval", "/tmp/cli.ts"], None),
+            (vec!["node", "-e", "/tmp/cli.ts"], None),
+            (vec!["node", "--eval=code", "/tmp/cli.ts"], None),
+            (vec!["node", "--print", "/tmp/cli.ts"], None),
+            (vec!["node"], None),
+        ] {
+            let argv = args
+                .iter()
+                .map(|arg| (*arg).to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                script_arg_token(&argv, flags, &[], true),
+                expected,
+                "{args:?}"
+            );
+        }
+        let legacy = ["node", "--unknown", "/tmp/cli.ts"].map(str::to_string);
+        assert_eq!(
+            script_arg_token(&legacy, flags, &[], false),
+            Some("/tmp/cli.ts")
+        );
+        assert_eq!(
+            script_arg_token(
+                &["node".into(), "-m".into(), "pi".into()],
+                &[],
+                &["-m"],
+                true
+            ),
+            None
+        );
+        assert_eq!(
+            script_arg_token(&["node".into(), "--".into(), "-".into()], flags, &[], true),
+            Some("-")
+        );
+    }
+
+    #[test]
+    fn identify_agent_in_job_rejects_invalid_package_entrypoints() {
+        for (name, manifest) in [
+            ("wrong target", Some(r#"{"bin":{"pi":"src/other.ts"}}"#)),
+            ("malformed", Some("{")),
+            ("missing", None),
+            ("unsupported", Some(r#"{"bin":["src/cli.ts"]}"#)),
+            (
+                "ambiguous",
+                Some(r#"{"bin":{"pi":"src/cli.ts","omp":"src/cli.ts"}}"#),
+            ),
+            ("unknown key", Some(r#"{"bin":{"other":"src/cli.ts"}}"#)),
+            ("absolute target", Some(r#"{"bin":{"pi":"/src/cli.ts"}}"#)),
+            ("empty target", Some(r#"{"bin":{"pi":""}}"#)),
+            (
+                "string other name",
+                Some(r#"{"name":"@example/renamed","bin":"src/cli.ts"}"#),
+            ),
+            ("root not object", Some(r#"["package"]"#)),
+        ] {
+            let root = temp_detection_path(name);
+            let script = root.join("src/cli.ts");
+            std::fs::create_dir_all(script.parent().expect("script parent")).expect("dirs");
+            std::fs::write(&script, "// fixture").expect("script");
+            if let Some(manifest) = manifest {
+                std::fs::write(root.join("package.json"), manifest).expect("manifest");
+            }
+            let path = script.to_str().expect("utf8 path");
+            let job = crate::platform::ForegroundJob {
+                process_group_id: 123,
+                processes: vec![foreground_process(123, "bun", &["bun", path])],
+            };
+            assert_eq!(identify_agent_in_job(&job), None, "{name}");
+            std::fs::remove_dir_all(root).expect("cleanup");
+        }
+
+        let root = temp_detection_path("nearest manifest");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(nested.join("src")).expect("dirs");
+        let script = nested.join("src/cli.ts");
+        std::fs::write(&script, "// fixture").expect("script");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"bin":{"pi":"nested/src/cli.ts"}}"#,
+        )
+        .expect("outer manifest");
+        std::fs::write(
+            nested.join("package.json"),
+            r#"{"bin":{"other":"src/cli.ts"}}"#,
+        )
+        .expect("inner manifest");
+        assert_eq!(read_package_entrypoint_agent(&script), None);
+        std::fs::remove_dir_all(root).expect("cleanup");
+
+        let root = temp_detection_path("missing file");
+        std::fs::create_dir_all(&root).expect("dirs");
+        std::fs::write(root.join("package.json"), r#"{"bin":{"pi":"cli.ts"}}"#).expect("manifest");
+        assert_eq!(read_package_entrypoint_agent(&root.join("cli.ts")), None);
+        std::fs::create_dir(root.join("cli.ts")).expect("directory instead of script");
+        assert_eq!(read_package_entrypoint_agent(&root.join("cli.ts")), None);
+        std::fs::remove_dir_all(root).expect("cleanup");
+
+        let root = temp_detection_path("oversized");
+        std::fs::create_dir_all(&root).expect("dirs");
+        let script = root.join("cli.ts");
+        std::fs::write(&script, "// fixture").expect("script");
+        std::fs::write(
+            root.join("package.json"),
+            " ".repeat(PACKAGE_MANIFEST_MAX_BYTES as usize + 1),
+        )
+        .expect("manifest");
+        assert_eq!(read_package_entrypoint_agent(&script), None);
+        std::fs::remove_dir_all(root).expect("cleanup");
+
+        let root = temp_detection_path("deep ancestor");
+        let mut script = root.clone();
+        for _ in 0..PACKAGE_MANIFEST_MAX_ANCESTORS {
+            script.push("nested");
+        }
+        std::fs::create_dir_all(&script).expect("dirs");
+        script.push("cli.ts");
+        std::fs::write(&script, "// fixture").expect("script");
+        let target = script.strip_prefix(&root).expect("relative script");
+        std::fs::write(
+            root.join("package.json"),
+            format!(r#"{{"bin":{{"pi":"{}"}}}}"#, target.display()),
+        )
+        .expect("manifest");
+        assert_eq!(read_package_entrypoint_agent(&script), None);
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn identify_agent_in_job_matches_string_bin_and_single_object_target() {
+        for (name, manifest, agent) in [
+            (
+                "@example/pi",
+                r#"{"name":"@example/pi","bin":"src/cli.ts"}"#,
+                Agent::Pi,
+            ),
+            ("omp", r#"{"name":"omp","bin":"src/cli.ts"}"#, Agent::Omp),
+            (
+                "other points away",
+                r#"{"bin":{"omp":"src/cli.ts","pi":"src/other.ts"}}"#,
+                Agent::Omp,
+            ),
+        ] {
+            let root = temp_detection_path("string and object target");
+            let script = root.join("src/cli.ts");
+            std::fs::create_dir_all(script.parent().expect("script parent")).expect("dirs");
+            std::fs::write(&script, "// fixture").expect("script");
+            std::fs::write(root.join("package.json"), manifest).expect("manifest");
+            assert_eq!(
+                read_package_entrypoint_agent(&script),
+                Some(agent),
+                "{name}"
+            );
+            std::fs::remove_dir_all(root).expect("cleanup");
+        }
+    }
+
+    #[test]
+    fn identify_agent_in_job_preserves_installed_name_precedence() {
+        let root = temp_detection_path("installed precedence");
+        std::fs::create_dir_all(&root).expect("dirs");
+        let script = root.join("omp");
+        std::fs::write(&script, "// fixture").expect("script");
+        std::fs::write(root.join("package.json"), r#"{"bin":{"pi":"omp"}}"#).expect("manifest");
+        let path = script.to_str().expect("utf8 path");
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(123, "bun", &["bun", path])],
+        };
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::Omp, "omp".to_string()))
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identify_agent_in_job_resolves_declared_symlinked_script_and_bin() {
+        let root = temp_detection_path("declared symlink");
+        let package = root.join("package");
+        let links = root.join("links");
+        std::fs::create_dir_all(package.join("src")).expect("package dirs");
+        std::fs::create_dir_all(&links).expect("link dirs");
+        let script = package.join("src/cli.ts");
+        std::fs::write(&script, "// fixture").expect("script");
+        std::os::unix::fs::symlink(&script, package.join("command.ts")).expect("bin link");
+        std::os::unix::fs::symlink(&script, links.join("entry.ts")).expect("executed link");
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"bin":{"omp":"command.ts"}}"#,
+        )
+        .expect("manifest");
+        let path = links.join("entry.ts");
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(
+                123,
+                "bun",
+                &["bun", path.to_str().expect("utf8 path")],
+            )],
+        };
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::Omp, "omp".to_string()))
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn package_entrypoint_cache_refreshes_expired_results() {
+        PACKAGE_ENTRYPOINT_CACHE.with(|cache| cache.borrow_mut().clear());
+        let root = temp_detection_path("cache refresh");
+        std::fs::create_dir_all(&root).expect("dirs");
+        let script = root.join("cli.ts");
+        std::fs::write(&script, "// fixture").expect("script");
+        let manifest = root.join("package.json");
+        std::fs::write(&manifest, r#"{"bin":{"omp":"cli.ts"}}"#).expect("manifest");
+        let now = std::time::Instant::now();
+        assert_eq!(package_entrypoint_agent_at(&script, now), Some(Agent::Omp));
+        std::fs::write(&manifest, r#"{"bin":{"pi":"cli.ts"}}"#).expect("updated manifest");
+        assert_eq!(
+            package_entrypoint_agent_at(&script, now + PACKAGE_ENTRYPOINT_CACHE_TTL / 2),
+            Some(Agent::Omp)
+        );
+        assert_eq!(
+            package_entrypoint_agent_at(&script, now + PACKAGE_ENTRYPOINT_CACHE_TTL),
+            Some(Agent::Pi)
+        );
+
+        let miss = root.join("missing.ts");
+        assert_eq!(package_entrypoint_agent_at(&miss, now), None);
+        std::fs::write(&miss, "// fixture").expect("late script");
+        std::fs::write(&manifest, r#"{"bin":{"omp":"missing.ts"}}"#).expect("late manifest");
+        assert_eq!(
+            package_entrypoint_agent_at(&miss, now + PACKAGE_ENTRYPOINT_CACHE_TTL / 2),
+            None
+        );
+        assert_eq!(
+            package_entrypoint_agent_at(&miss, now + PACKAGE_ENTRYPOINT_CACHE_TTL),
+            Some(Agent::Omp)
+        );
+
+        for index in 0..PACKAGE_ENTRYPOINT_CACHE_CAPACITY {
+            let other = root.join(format!("other-{index}.ts"));
+            assert_eq!(
+                package_entrypoint_agent_at(&other, now + PACKAGE_ENTRYPOINT_CACHE_TTL),
+                None
+            );
+        }
+        assert_eq!(
+            package_entrypoint_agent_at(&script, now + PACKAGE_ENTRYPOINT_CACHE_TTL),
+            None
+        );
+        PACKAGE_ENTRYPOINT_CACHE
+            .with(|cache| assert_eq!(cache.borrow().len(), PACKAGE_ENTRYPOINT_CACHE_CAPACITY));
+        PACKAGE_ENTRYPOINT_CACHE.with(|cache| cache.borrow_mut().clear());
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
     #[test]
     fn identify_agent_in_job_detects_node_wrapped_pi_package_cli() {
         let job = crate::platform::ForegroundJob {
