@@ -95,6 +95,35 @@ pub(crate) fn launch_executable() -> std::io::Result<std::path::PathBuf> {
     std::env::current_exe()
 }
 
+pub(crate) fn open_regular_file_for_detection(
+    path: &std::path::Path,
+) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not a regular file",
+        ));
+    }
+    let file = open_nonblocking_file_platform(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not a regular file",
+        ));
+    }
+    Ok((file, metadata))
+}
+
+#[cfg(unix)]
+use unix_common::open_nonblocking_file_platform;
+
+#[cfg(not(unix))]
+fn open_nonblocking_file_platform(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
 pub(crate) fn detached_custom_command_process(command: &str) -> std::process::Command {
     let mut process = detached_custom_command_process_platform(command);
     configure_background_command(&mut process);

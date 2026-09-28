@@ -328,6 +328,15 @@ pub(crate) fn create_remote_ssh_config_file(path: &Path) -> std::io::Result<std:
         .open(path)
 }
 
+pub(super) fn open_nonblocking_file_platform(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+}
+
 pub(crate) fn create_remote_private_dir(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
 

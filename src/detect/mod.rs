@@ -487,13 +487,13 @@ fn read_package_entrypoint_agent(script: &std::path::Path) -> Option<Agent> {
         .ancestors()
         .take(PACKAGE_MANIFEST_MAX_ANCESTORS)
     {
-        let manifest = match std::fs::File::open(dir.join("package.json")) {
-            Ok(manifest) => manifest,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return None,
-        };
-        let metadata = manifest.metadata().ok()?;
-        if !metadata.is_file() || metadata.len() > PACKAGE_MANIFEST_MAX_BYTES {
+        let (manifest, metadata) =
+            match crate::platform::open_regular_file_for_detection(&dir.join("package.json")) {
+                Ok(opened) => opened,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return None,
+            };
+        if metadata.len() > PACKAGE_MANIFEST_MAX_BYTES {
             return None;
         }
         let mut bytes = Vec::new();
@@ -1647,6 +1647,37 @@ mod tests {
             );
             std::fs::remove_dir_all(root).expect("remove fixture");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identify_agent_in_job_rejects_fifo_manifest_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = temp_detection_path("fifo manifest");
+        let script = root.join("src/cli.ts");
+        std::fs::create_dir_all(script.parent().expect("script parent")).expect("dirs");
+        std::fs::write(&script, "// fixture").expect("script");
+        let manifest = root.join("package.json");
+        let path = std::ffi::CString::new(manifest.as_os_str().as_bytes()).expect("fifo path");
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let script = script.to_str().expect("utf8 path").to_string();
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 123,
+            processes: vec![foreground_process(123, "bun", &["bun", &script])],
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            sender
+                .send(identify_agent_in_job(&job))
+                .expect("send result");
+        });
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        if result.is_ok() {
+            worker.join().expect("probe thread");
+        }
+        std::fs::remove_dir_all(root).expect("cleanup");
+        assert_eq!(result, Ok(None));
     }
 
     #[test]
